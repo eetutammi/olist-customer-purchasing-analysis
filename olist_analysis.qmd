@@ -1,0 +1,1332 @@
+---
+title: "Customer Purchase Behavior Analysis"
+author: "Eetu Tammi"
+format: html
+editor: visual
+---
+
+## Introduction
+
+This project analyzes customer purchasing behavior using the Olist Brazilian E-Commerce Public Dataset.
+
+The analysis focuses on customer retention, purchasing behavior, and customer value, with the aim of understanding why some customers return and why some customers generate substantially more revenue than others.
+
+The first research question is:
+
+**How common are repeat purchases, and what characteristics of the first purchase are associated with customers returning?**
+
+The analysis examines the frequency of repeat purchases, the time between the first and second order, differences between repeat and non-repeat customers, the relationship between first-order product categories and repeat purchasing, and whether repeat purchases can be predicted using information available from the first order.
+
+The second research question is:
+
+**Which customers are most valuable, and can high-value customers be identified using information from their first purchase?**
+
+The analysis examines the distribution of customer spending, the concentration of revenue among high-value customers, differences in customer value across first-order categories, and whether high-value customers can be identified using characteristics of their first purchase.
+
+The third research question is:
+
+**How is delivery performance associated with customer satisfaction and repeat purchasing?**
+
+The analysis examines whether late deliveries are associated with lower review scores and lower repeat-purchase rates.
+
+## Data
+
+The analysis uses five datasets from the Olist e-commerce dataset:
+
+- orders
+- customers
+- order items
+- products
+- reviews
+
+The analysis focuses on customer orders, repeat purchasing, first-order characteristics, product categories, delivery experience, and customer reviews.
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(pROC)
+```
+
+```{r, echo=FALSE, message=FALSE}
+orders <- read_csv("data/olist_orders_dataset.csv")
+customers <- read_csv("data/olist_customers_dataset.csv")
+items <- read_csv("data/olist_order_items_dataset.csv")
+products <- read_csv("data/olist_products_dataset.csv")
+reviews <- read_csv("data/olist_order_reviews_dataset.csv")
+```
+
+## Data Preparation
+
+The analysis uses `customer_unique_id` as the customer identifier. The `customer_id` in the orders data identifies a customer record, so orders are linked to the customer data and grouped using `customer_unique_id` to identify individual customers across orders.
+
+Orders are sorted by purchase timestamp for each customer, allowing the first and second orders to be identified. A repeat purchase is defined as a second order occurring at least one day after the first order. Customers without a qualifying second order are classified as non-repeat customers.
+
+For the first order, additional characteristics are collected, including order value, number of items, freight value, delivery time, product category, and review score. These variables are used to compare repeat and non-repeat customers and to evaluate whether repeat purchases can be predicted from information available at the first purchase.
+
+Delivery performance is also included in the first-order data. Delivery time and whether the order was delivered later than the estimated delivery date are used to examine the relationship between delivery performance, customer satisfaction, and repeat purchasing.
+
+In addition, all orders are aggregated at the customer level to measure customer value. Total spending, number of orders, number of items, average order value, and other customer-level measures are calculated. Customers in the top 10% of total spending are classified as high-value customers. These measures are then used to examine revenue concentration and whether high-value customers can be identified from characteristics of their first purchase.
+
+```{r, echo=FALSE, message=FALSE}
+orders_customers <- orders %>%
+  left_join(
+    customers %>%
+      select(customer_id, customer_unique_id),
+    by = "customer_id"
+  )
+
+customer_orders <- orders_customers %>%
+  count(customer_unique_id, name = "number_of_orders")
+
+
+# Repeat purchase analysis
+
+
+# Order sequence for each customer
+customer_orders <- orders_customers %>%
+  arrange(
+    customer_unique_id,
+    order_purchase_timestamp,
+    order_id
+  ) %>%
+  group_by(customer_unique_id) %>%
+  mutate(order_number = row_number()) %>%
+  ungroup()
+
+
+# First order
+first_orders <- customer_orders %>%
+  filter(order_number == 1) %>%
+  select(
+    customer_unique_id,
+    first_order_id = order_id,
+    first_order_date = order_purchase_timestamp
+  )
+
+
+# Second order
+second_orders <- customer_orders %>%
+  filter(order_number == 2) %>%
+  select(
+    customer_unique_id,
+    second_order_date = order_purchase_timestamp
+  )
+
+
+# Customers with an observed repeat purchase
+repeat_customers <- first_orders %>%
+  inner_join(
+    second_orders,
+    by = "customer_unique_id"
+  ) %>%
+  mutate(
+    days_to_second_order = as.numeric(
+      difftime(
+        second_order_date,
+        first_order_date,
+        units = "days"
+      )
+    )
+  ) %>%
+  filter(days_to_second_order >= 1)
+
+
+# Repeat purchase summary
+total_customers <- n_distinct(
+  customers$customer_unique_id
+)
+
+repeat_customer_count <- nrow(
+  repeat_customers
+)
+
+repeat_purchase_rate <-
+  repeat_customer_count /
+  total_customers * 100
+
+repeat_purchase_summary <- tibble(
+  customer_group = c(
+    "No observed repeat purchase",
+    "Observed repeat purchase"
+  ),
+  number_of_customers = c(
+    total_customers - repeat_customer_count,
+    repeat_customer_count
+  )
+) %>%
+  mutate(
+    percentage =
+      number_of_customers /
+      sum(number_of_customers) * 100
+  )
+
+
+
+# First-order characteristics
+
+
+order_features <- items %>%
+  group_by(order_id) %>%
+  summarise(
+    order_value = sum(price, na.rm = TRUE),
+    freight_value = sum(freight_value, na.rm = TRUE),
+    number_of_items = n(),
+    .groups = "drop"
+  )
+
+
+first_order_analysis <- first_orders %>%
+  left_join(
+    order_features,
+    by = c("first_order_id" = "order_id")
+  ) %>%
+  left_join(
+    repeat_customers %>%
+      distinct(customer_unique_id) %>%
+      mutate(repeat_purchase = 1),
+    by = "customer_unique_id"
+  ) %>%
+  mutate(
+    repeat_purchase = replace_na(
+      repeat_purchase,
+      0
+    )
+  )
+
+
+
+# Delivery information
+
+
+delivery_features <- orders %>%
+  filter(
+    !is.na(order_delivered_customer_date),
+    !is.na(order_purchase_timestamp)
+  ) %>%
+  mutate(
+    delivery_days = as.numeric(
+      difftime(
+        order_delivered_customer_date,
+        order_purchase_timestamp,
+        units = "days"
+      )
+    )
+  ) %>%
+  select(
+    order_id,
+    delivery_days
+  )
+
+first_order_analysis <- first_order_analysis %>%
+  left_join(
+    delivery_features,
+    by = c("first_order_id" = "order_id")
+  )
+
+
+# Delivery delay
+delivery_delay <- orders %>%
+  filter(
+    !is.na(order_delivered_customer_date),
+    !is.na(order_estimated_delivery_date)
+  ) %>%
+  mutate(
+    delivery_delay_days = as.numeric(
+      difftime(
+        order_delivered_customer_date,
+        order_estimated_delivery_date,
+        units = "days"
+      )
+    ),
+    delivered_late = if_else(
+      delivery_delay_days > 0,
+      1,
+      0
+    )
+  ) %>%
+  select(
+    order_id,
+    delivery_delay_days,
+    delivered_late
+  )
+
+first_order_analysis <- first_order_analysis %>%
+  left_join(
+    delivery_delay,
+    by = c("first_order_id" = "order_id")
+  )
+
+
+
+# Product category
+
+
+items_products <- items %>%
+  left_join(
+    products %>%
+      select(
+        product_id,
+        product_category_name
+      ),
+    by = "product_id"
+  )
+
+
+first_order_category <- first_orders %>%
+  left_join(
+    items_products %>%
+      select(
+        order_id,
+        product_category_name
+      ),
+    by = c("first_order_id" = "order_id")
+  ) %>%
+  filter(
+    !is.na(product_category_name)
+  ) %>%
+  count(
+    customer_unique_id,
+    first_order_id,
+    product_category_name
+  ) %>%
+  group_by(
+    customer_unique_id,
+    first_order_id
+  ) %>%
+  slice_max(
+    n,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  select(
+    customer_unique_id,
+    first_order_id,
+    first_order_category = product_category_name
+  )
+
+first_order_analysis <- first_order_analysis %>%
+  left_join(
+    first_order_category,
+    by = c(
+      "customer_unique_id",
+      "first_order_id"
+    )
+  )
+
+
+
+# Reviews
+
+
+first_order_analysis <- first_order_analysis %>%
+  left_join(
+    reviews %>%
+      select(
+        order_id,
+        review_score
+      ),
+    by = c("first_order_id" = "order_id")
+  )
+
+
+
+# Category repeat rates
+
+
+category_repeat_rate <- first_order_analysis %>%
+  filter(
+    !is.na(first_order_category)
+  ) %>%
+  group_by(first_order_category) %>%
+  summarise(
+    customers = n(),
+    repeat_customers = sum(repeat_purchase),
+    repeat_rate = mean(repeat_purchase) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(
+    customers >= 100
+  ) %>%
+  arrange(
+    desc(repeat_rate)
+  )
+
+
+
+# Chi-squared test
+
+
+category_test <- chisq.test(
+  table(
+    first_order_analysis$first_order_category,
+    first_order_analysis$repeat_purchase
+  ),
+  simulate.p.value = TRUE,
+  B = 10000
+)
+
+
+
+# Logistic regression
+
+
+common_categories <- first_order_analysis %>%
+  count(first_order_category) %>%
+  filter(
+    !is.na(first_order_category),
+    n >= 100
+  ) %>%
+  pull(first_order_category)
+
+model_data <- first_order_analysis %>%
+  mutate(
+    first_order_category = if_else(
+      is.na(first_order_category) |
+        !first_order_category %in% common_categories,
+      "other",
+      first_order_category
+    )
+  ) %>%
+  filter(
+    !is.na(order_value),
+    !is.na(number_of_items),
+    !is.na(freight_value),
+    !is.na(first_order_category)
+  )
+
+
+set.seed(123)
+
+train_index <- sample(
+  seq_len(nrow(model_data)),
+  size = 0.8 * nrow(model_data)
+)
+
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+
+logistic_model <- glm(
+  repeat_purchase ~
+    order_value +
+    number_of_items +
+    freight_value +
+    first_order_category,
+  data = train_data,
+  family = binomial
+)
+
+
+# Predictions
+test_data <- test_data %>%
+  mutate(
+    predicted_probability = predict(
+      logistic_model,
+      newdata = test_data,
+      type = "response"
+    )
+  )
+
+
+# AUC
+roc_curve <- roc(
+  test_data$repeat_purchase,
+  test_data$predicted_probability
+)
+
+model_auc <- as.numeric(
+  auc(roc_curve)
+)
+```
+
+
+
+```{r}
+#| include: false
+# Research Question 2: Customer Value Data Preparation
+
+
+# 1. Customer-level value
+
+
+customer_value <- orders_customers %>%
+  select(
+    customer_unique_id,
+    order_id,
+    order_purchase_timestamp
+  ) %>%
+  left_join(
+    order_features,
+    by = "order_id"
+  ) %>%
+  group_by(customer_unique_id) %>%
+  summarise(
+    total_spend = sum(
+      order_value,
+      na.rm = TRUE
+    ),
+    total_freight = sum(
+      freight_value,
+      na.rm = TRUE
+    ),
+    number_of_orders = n_distinct(
+      order_id
+    ),
+    total_items = sum(
+      number_of_items,
+      na.rm = TRUE
+    ),
+    average_order_value = mean(
+      order_value,
+      na.rm = TRUE
+    ),
+    first_order_date = min(
+      order_purchase_timestamp,
+      na.rm = TRUE
+    ),
+    last_order_date = max(
+      order_purchase_timestamp,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    customer_lifetime_days = as.numeric(
+      difftime(
+        last_order_date,
+        first_order_date,
+        units = "days"
+      )
+    )
+  )
+
+
+
+# 2. Add first-order information
+
+
+customer_value <- customer_value %>%
+  left_join(
+    first_order_analysis %>%
+      select(
+        customer_unique_id,
+        repeat_purchase,
+        first_order_category
+      ),
+    by = "customer_unique_id"
+  )
+
+
+
+# 3. Define high-value customers
+
+
+high_value_threshold <- quantile(
+  customer_value$total_spend,
+  0.90,
+  na.rm = TRUE
+)
+
+customer_value <- customer_value %>%
+  mutate(
+    high_value_customer =
+      total_spend >= high_value_threshold
+  )
+
+
+
+# 4. Customer-value summary
+
+
+customer_value_summary <- customer_value %>%
+  group_by(
+    high_value_customer
+  ) %>%
+  summarise(
+    customers = n(),
+    median_total_spend =
+      median(
+        total_spend,
+        na.rm = TRUE
+      ),
+    mean_total_spend =
+      mean(
+        total_spend,
+        na.rm = TRUE
+      ),
+    median_number_of_orders =
+      median(
+        number_of_orders,
+        na.rm = TRUE
+      ),
+    mean_number_of_orders =
+      mean(
+        number_of_orders,
+        na.rm = TRUE
+      ),
+    .groups = "drop"
+  )
+
+
+
+# 5. Revenue concentration
+
+
+high_value_summary <- customer_value %>%
+  summarise(
+    high_value_customers =
+      sum(high_value_customer),
+    total_customers =
+      n(),
+    high_value_share =
+      mean(high_value_customer) * 100,
+    high_value_revenue_share =
+      sum(
+        total_spend[
+          high_value_customer
+        ],
+        na.rm = TRUE
+      ) /
+      sum(
+        total_spend,
+        na.rm = TRUE
+      ) * 100
+  )
+
+
+
+# 6. High-value customers by first-order category
+
+
+high_value_by_category <- customer_value %>%
+  filter(
+    !is.na(first_order_category)
+  ) %>%
+  group_by(
+    first_order_category
+  ) %>%
+  summarise(
+    customers = n(),
+    high_value_customers =
+      sum(high_value_customer),
+    high_value_rate =
+      mean(high_value_customer) * 100,
+    median_total_spend =
+      median(
+        total_spend,
+        na.rm = TRUE
+      ),
+    .groups = "drop"
+  ) %>%
+  filter(
+    customers >= 100
+  ) %>%
+  arrange(
+    desc(high_value_rate)
+  )
+
+
+
+# 7. Prepare high-value prediction data
+
+
+model_data_value <- first_order_analysis %>%
+  left_join(
+    customer_value %>%
+      select(
+        customer_unique_id,
+        high_value_customer
+      ),
+    by = "customer_unique_id"
+  ) %>%
+  filter(
+    !is.na(order_value),
+    !is.na(number_of_items),
+    !is.na(freight_value),
+    !is.na(delivery_days),
+    !is.na(review_score),
+    !is.na(first_order_category),
+    !is.na(high_value_customer)
+  )
+
+
+# Combine rare product categories
+common_categories_value <- model_data_value %>%
+  count(
+    first_order_category
+  ) %>%
+  filter(
+    n >= 100
+  ) %>%
+  pull(
+    first_order_category
+  )
+
+model_data_value <- model_data_value %>%
+  mutate(
+    first_order_category = if_else(
+      first_order_category %in%
+        common_categories_value,
+      first_order_category,
+      "other"
+    )
+  )
+
+
+
+# 8. Train/test split
+
+
+set.seed(123)
+
+train_index_value <- sample(
+  seq_len(
+    nrow(model_data_value)
+  ),
+  size = 0.80 *
+    nrow(model_data_value)
+)
+
+train_data_value <-
+  model_data_value[
+    train_index_value,
+  ]
+
+test_data_value <-
+  model_data_value[
+    -train_index_value,
+  ]
+
+
+
+# 9. Logistic regression
+
+
+high_value_model <- glm(
+  high_value_customer ~
+    order_value +
+    number_of_items +
+    freight_value +
+    delivery_days +
+    review_score +
+    first_order_category,
+  data = train_data_value,
+  family = binomial
+)
+
+
+
+# 10. Predictions
+
+
+test_data_value <- test_data_value %>%
+  mutate(
+    predicted_probability =
+      predict(
+        high_value_model,
+        newdata = test_data_value,
+        type = "response"
+      )
+  )
+
+
+
+# 11. ROC and AUC
+
+
+roc_high_value <- roc(
+  test_data_value$high_value_customer,
+  test_data_value$predicted_probability
+)
+
+auc_high_value <- as.numeric(
+  auc(roc_high_value)
+)
+```
+
+
+```{r}
+#| include: false
+# Research Question 3: Delivery Experience and Customer Data Preparation
+# Satisfaction
+# Delivery performance by repeat-purchase status
+
+delivery_by_repeat <- first_order_analysis %>%
+  group_by(repeat_purchase) %>%
+  summarise(
+    customers = n(),
+    median_delivery_days =
+      median(delivery_days, na.rm = TRUE),
+    mean_delivery_days =
+      mean(delivery_days, na.rm = TRUE),
+    late_delivery_rate =
+      mean(delivered_late, na.rm = TRUE) * 100,
+    median_review_score =
+      median(review_score, na.rm = TRUE),
+    mean_review_score =
+      mean(review_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Review scores by delivery status
+
+review_by_delivery <- first_order_analysis %>%
+  filter(
+    !is.na(delivered_late),
+    !is.na(review_score)
+  ) %>%
+  group_by(delivered_late) %>%
+  summarise(
+    customers = n(),
+    median_review_score =
+      median(review_score, na.rm = TRUE),
+    mean_review_score =
+      mean(review_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Repeat-purchase rate by delivery status
+
+repeat_by_delivery <- first_order_analysis %>%
+  filter(
+    !is.na(delivered_late),
+    !is.na(repeat_purchase)
+  ) %>%
+  group_by(delivered_late) %>%
+  summarise(
+    customers = n(),
+    repeat_customers = sum(repeat_purchase),
+    repeat_rate =
+      mean(repeat_purchase) * 100,
+    .groups = "drop"
+  )
+
+# Statistical tests
+
+wilcox_review_delivery <- wilcox.test(
+  review_score ~ delivered_late,
+  data = first_order_analysis %>%
+    filter(
+      !is.na(review_score),
+      !is.na(delivered_late)
+    )
+)
+
+delivery_repeat_test <- chisq.test(
+  table(
+    first_order_analysis$delivered_late,
+    first_order_analysis$repeat_purchase
+  ),
+  simulate.p.value = TRUE,
+  B = 10000
+)
+```
+
+
+
+## Research Question 1: Repeat Purchases
+
+### Question
+
+**How common are repeat purchases, what characteristics are associated with customers returning, and can repeat purchases be predicted from information available at the first purchase?**
+
+The aim of this part of the analysis is to understand customer retention and identify patterns associated with repeat purchasing. The analysis first examines how common repeat purchases are and how long customers typically take to place a second order.
+
+The analysis then compares repeat and non-repeat customers based on characteristics of their first purchase, including order value, number of items, freight value, delivery time, product category, and review score. Finally, a logistic regression model is used to evaluate whether repeat purchases can be predicted using information available from the first order.
+
+### How common are repeat purchases?
+
+The analysis identified 96,096 unique customers. Of these, 2,070 customers made an observed repeat purchase, corresponding to a repeat purchase rate of approximately 2.2%.
+
+```{r}
+#| echo: false
+
+total_customers <- n_distinct(customers$customer_unique_id)
+
+repeat_customer_count <- nrow(repeat_customers)
+
+repeat_purchase_summary <- tibble(
+  customer_group = c(
+    "No observed repeat purchase",
+    "Observed repeat purchase"
+  ),
+  number_of_customers = c(
+    total_customers - repeat_customer_count,
+    repeat_customer_count
+  )
+) %>%
+  mutate(
+    percentage = number_of_customers /
+      sum(number_of_customers) * 100
+  )
+```
+
+```{r}
+#| echo: false
+#| label: fig-repeat-rate
+#| fig-cap: "Observed repeat purchase among unique customers."
+
+ggplot(
+  repeat_purchase_summary,
+  aes(
+    x = customer_group,
+    y = percentage
+  )
+) +
+  geom_col() +
+  geom_text(
+    aes(label = paste0(round(percentage, 1), "%")),
+    vjust = -0.5
+  ) +
+  labs(
+    x = NULL,
+    y = "Share of customers (%)"
+  ) +
+  theme_minimal()
+```
+
+The result shows that repeat purchasing is relatively uncommon in the observed data. Approximately **97.8%** of customers did not have an observed second purchase, while only **2.2%** made a qualifying repeat purchase.
+
+This result should be interpreted with some caution. The dataset covers a limited observation period, meaning that customers who made their first purchase near the end of the period may not have had enough time to return. Therefore, the observed repeat purchase rate should not be interpreted as a complete measure of long-term customer retention.
+
+### How long does it take customers to return?
+
+Among customers who made a qualifying second purchase, the median time between the first and second order was **74.8 days**. The mean was considerably higher at **116.3 days**, indicating **a right-skewed distribution**.
+
+The shortest observed interval was approximately one day, while the longest was approximately 609 days.
+
+```{r}
+#| echo: false
+#| label: fig-second-order-time
+#| fig-cap: "Distribution of the time between the first and second order."
+ggplot(
+  repeat_customers,
+  aes(x = days_to_second_order)
+) +
+  geom_histogram(bins = 50) +
+  labs(
+    x = "Days between first and second order",
+    y = "Number of customers"
+  ) +
+  theme_minimal()
+```
+
+The difference between the median and mean suggests that most returning customers purchase again relatively soon, while a smaller number return much later. The median of approximately 75 days therefore provides a more representative measure of typical repeat purchase timing than the mean.
+
+### Do first-order characteristics differ between customer groups?
+
+The next step compares the first orders of customers who did and did not make a repeat purchase.
+
+```{r, echo=FALSE}
+first_order_analysis %>%
+  group_by(repeat_purchase) %>%
+  summarise(
+    customers = n(),
+    median_order_value = median(order_value, na.rm = TRUE),
+    mean_order_value = mean(order_value, na.rm = TRUE),
+    median_items = median(number_of_items, na.rm = TRUE),
+    mean_items = mean(number_of_items, na.rm = TRUE),
+    median_freight = median(freight_value, na.rm = TRUE),
+    mean_freight = mean(freight_value, na.rm = TRUE),
+    median_delivery_days = median(delivery_days, na.rm = TRUE),
+    mean_delivery_days = mean(delivery_days, na.rm = TRUE),
+    median_review_score = median(review_score, na.rm = TRUE),
+    mean_review_score = mean(review_score, na.rm = TRUE),
+    late_delivery_rate = mean(
+      delivered_late,
+      na.rm = TRUE
+    ) * 100,
+    .groups = "drop"
+  )
+```
+
+The descriptive comparison shows relatively small differences in first-order value between the two groups. The median order value was approximately 86.9€ among customers without an observed repeat purchase and **85.1€** among repeat customers. Mean order value was also slightly lower among repeat customers (**129€ compared with 138€**).
+
+A more noticeable difference was found in the number of items purchased. The mean number of items was 1.14 among customers without a repeat purchase and 1.21 among repeat customers.
+
+This suggests that customers purchasing several items in their first order may be somewhat more likely to return, although the difference alone does not establish a causal relationship.
+
+### Does the first product category matter?
+
+The first-order product category was also examined. To avoid unstable estimates based on very small customer groups, categories with fewer than 100 customers were excluded from the descriptive comparison.
+
+```{r}
+#| echo: false
+#| label: fig-category-repeat
+#| fig-cap: "Repeat purchase rate by first-order product category. Categories with fewer than 100 customers are excluded."
+category_repeat_rate %>%
+  slice_max(
+    repeat_rate,
+    n = 10
+  ) %>%
+  ggplot(
+    aes(
+      x = reorder(first_order_category, repeat_rate),
+      y = repeat_rate
+    )
+  ) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "First-order category",
+    y = "Repeat purchase rate (%)"
+  ) +
+  theme_minimal()
+```
+
+There are clear differences in observed repeat purchase rates between product categories. Among categories with at least 100 customers, the highest observed rates included men's fashion (4.67%), fashion underwear and beachwear (4.24%), beverages (3.96%), and fashion bags and accessories (3.61%).
+
+However, the smallest categories also have relatively few repeat customers, so individual percentages should not be overinterpreted.
+
+A Pearson chi-squared test with a simulated p-value was used because the category data contain many groups with relatively small counts.
+
+```{r, echo=FALSE}
+category_test
+```
+
+The test produced **a simulated p-value below 0.001**, indicating that the distribution of repeat purchases differs across first-order categories. This provides evidence of an association between the category of the first purchase and subsequent repeat purchasing.
+
+The result does not, however, mean that purchasing a particular category causes customers to return. Category differences may reflect other characteristics of the products or customers.
+
+### Can repeat purchases be predicted from the first order?
+
+To examine whether repeat purchases can be predicted using information available from the first order, a logistic regression model was estimated.
+
+The model included:
+
+- first-order value
+- number of items
+- freight value
+- first-order product category
+
+The data were divided into training and test sets, with 80% of observations used for training and 20% for testing.
+
+```{r}
+#| echo: false
+
+options(width = 150)
+
+summary(logistic_model)
+```
+
+The number of items in the first order was the clearest continuous predictor in the model. Its coefficient was positive and **statistically significant (p \< 0.001)**. This indicates that customers who purchased more items in their first order tended to have higher odds of making a repeat purchase.
+
+Order value and freight value were not statistically significant predictors in the model.
+
+Although the category-level coefficients varied, most individual category effects were not statistically significant. This is consistent with the large number of categories and relatively small number of repeat purchases.
+
+### How well can repeat purchases be predicted?
+
+The model was evaluated using the test data and the area under the ROC curve (AUC).
+
+```{r, echo=FALSE}
+auc(roc_curve)
+```
+
+The resulting AUC was **0.546**.
+
+An AUC of 0.5 corresponds to random classification. Therefore, the model's performance is only slightly better than random prediction.
+
+This is an important finding. Although some variables are statistically associated with repeat purchasing, the available first-order information does not provide strong enough predictive power to reliably identify which individual customers will return.
+
+### Findings
+
+Overall, the analysis produces four main findings.
+
+1.  **Repeat purchasing is relatively uncommon.** Only approximately 2.2% of unique customers made an observed second purchase at least one day after their first order.
+
+2.  **Returning customers typically return after several weeks.** The median time to a second order was approximately 75 days, although some customers returned substantially later.
+
+3.  **Product category is associated with repeat purchasing.** The chi-squared test indicates statistically significant differences in repeat purchasing across first-order categories. However, small category sizes mean that individual category percentages should be interpreted cautiously.
+
+4.  **Predicting individual repeat purchases is difficult.** The number of items in the first order was positively associated with repeat purchasing, but the logistic regression model achieved an AUC of only 0.546 on unseen data. This suggests that the variables available from the first purchase are not sufficient for accurate individual-level prediction.
+
+Taken together, the results suggest that customer retention is a potential business opportunity, but the available transaction-level variables do not provide a strong basis for predicting individual repeat customers. The next analysis can therefore focus on understanding **customer value and which customer segments represent the greatest retention opportunity**.
+
+## Research Question 2: Customer Value
+
+### Question
+
+**Which customers are most valuable, and can high-value customers be identified using information from their first purchase?**
+
+The previous analysis focused on whether a customer makes another purchase. However, repeat purchasing alone does not describe the economic value of a customer. A customer who makes several small purchases may generate less revenue than a customer who makes fewer but substantially larger purchases.
+
+Therefore, this part of the analysis focuses on customer value. Customers are classified as high-value customers if their total spending is in the top 10% of the customer distribution. The analysis then examines how customer value is distributed and whether high-value customers can be identified using information available from their first purchase.
+
+
+
+### Customer Value
+
+Customer value is calculated by aggregating all orders belonging to the same `customer_unique_id`. For each customer, total spending, total freight costs, number of orders, number of items, and average order value are calculated.
+
+```{r}
+#| echo: false
+
+customer_value_summary
+```
+
+The results show a clear difference between high-value and other customers. The median total spending among high-value customers is **420€**, compared with **78.90€** among other customers. High-value customers also place slightly more orders on average.
+
+### Revenue Concentration
+
+High-value customers represent only **10% of the customer base**, but they account for **41.4% of total customer spending**.
+
+```{r}
+#| echo: false
+
+high_value_summary
+```
+
+This indicates that customer value is highly concentrated. A relatively small proportion of customers generates a disproportionately large share of total revenue.
+
+### Distribution of Customer Spending
+
+The distribution of total customer spending is strongly right-skewed. Most customers spend relatively small amounts, while a small number of customers have substantially higher total spending.
+
+```{r}
+#| echo: false
+#| fig-cap: "Distribution of total customer spending. The x-axis is limited to the 99th percentile for visual clarity."
+
+ggplot(
+  customer_value,
+  aes(x = total_spend)
+) +
+  geom_histogram(
+    bins = 400
+  ) +
+  coord_cartesian(
+    xlim = c(
+      0,
+      quantile(
+        customer_value$total_spend,
+        0.99,
+        na.rm = TRUE
+      )
+    )
+  ) +
+  labs(
+    x = "Total customer spending (€)",
+    y = "Number of customers"
+  ) +
+  theme_minimal()
+```
+
+The high concentration of spending supports the use of a high-value customer segment rather than relying only on average customer spending.
+
+### High-Value Customers by First-Order Category
+
+The first-order category is also compared across high-value and other customers.
+
+```{r}
+#| echo: false
+
+high_value_by_category %>%
+  arrange(desc(high_value_rate)) %>%
+  head(15)
+```
+
+The high-value rate varies substantially across first-order product categories. Among categories with at least 100 customers, **pcs** has by far the highest high-value rate at **99.4%**, although this category contains only 176 customers. The next highest rates are observed for **agro_industria_e_comercio (52.2%)** and **eletrodomesticos_2 (46.2%)**.
+
+Other categories with relatively high high-value rates include **instrumentos_musicais (30.1%)**, **construcao_ferramentas_seguranca (29.1%)**, and **eletroportateis (29.1%)**. In contrast, larger categories such as **relogios_presentes**, with 5,431 customers, have a more moderate high-value rate of **17.9%**.
+
+The results suggest that the product category of the first purchase may be associated with subsequent customer value. However, the highest rates in some categories are based on relatively small customer groups, so these results should be interpreted with caution.
+
+### Predicting High-Value Customers
+
+The next step is to test whether high-value customers can be identified using information available from their first purchase.
+
+A logistic regression model is used with high-value customer status as the outcome. The predictors describe the first purchase:
+
+- order value
+
+- number of items
+
+- freight value
+
+- delivery time
+
+- review score
+
+- first-order product category
+
+The model is evaluated on a separate test set using ROC-AUC.
+
+```{r}
+#| echo: false
+
+summary(high_value_model)
+```
+
+The strongest predictor is the value of the first order. The coefficient for order_value is positive and highly statistically significant, indicating that customers with larger first purchases are substantially more likely to belong to the high-value customer group.
+
+Most individual product categories are not statistically significant after controlling for the other first-order characteristics.
+
+### Model Performance
+
+The model achieves a ROC-AUC of **0.98** on the test data.
+
+```{r}
+#| echo: false
+
+auc_high_value
+```
+
+An AUC of approximately 0.98 indicates excellent discrimination between high-value and other customers in the test data.
+
+However, the very high AUC should be interpreted with care. High-value status is defined using customers' total spending, while first-order value is included as a predictor. Therefore, a large first purchase naturally provides strong information about whether the customer's eventual total spending will be high.
+
+The result should therefore not be interpreted as evidence that high-value customers can be identified perfectly from general behavioral characteristics. Instead, it shows that **initial purchase value is a very strong indicator of eventual customer value in this dataset**.
+
+### Conclusion
+
+The analysis shows a strong concentration of customer value in the Olist data. The top 10% of customers account for **41.4% of total spending**, while their median spending is substantially higher than that of other customers.
+
+The predictive analysis also shows that high-value customers can be distinguished very accurately using first-order information, with a test-set ROC-AUC of **0.98**.. The dominant predictor is the value of the first purchase.
+
+This provides a different perspective from the first research question. While repeat purchasing was relatively difficult to predict from first-order characteristics, customer value was much more strongly associated with the initial order value.
+
+
+
+
+## Research Question 3: Delivery Experience and Customer Satisfaction
+
+### Question
+
+**How is delivery performance associated with customer satisfaction and repeat purchasing?**
+
+The previous analyses focused on customer retention and customer value. This part of the analysis examines whether the delivery experience is associated with customer satisfaction and customers' likelihood of making another purchase.
+
+The analysis compares on-time and late deliveries using review scores and repeat-purchase rates. Statistical tests are also used to evaluate whether the observed differences are unlikely to be due to random variation.
+
+
+### Delivery Performance and Repeat Purchasing
+
+The delivery experience differs somewhat between customers who do and do not make another purchase.
+
+```{r}
+#| echo: false
+
+delivery_by_repeat
+```
+
+Repeat customers experienced slightly fewer late deliveries than non-repeat customers. The late-delivery rate was **5.91%** among repeat customers compared with **8.19%** among customers who did not make another observed repeat purchase.
+
+The average delivery time was also slightly shorter among repeat customers, at **11.9 days** compared with **12.6 days** among non-repeat customers. However, the difference in delivery time itself is relatively small.
+
+### Delivery Performance and Review Scores
+
+A much stronger difference can be observed in customer review scores.
+
+```{r}
+#| echo: false
+
+review_by_delivery
+```
+
+Customers whose orders were delivered on time gave an average review score of **4.29**, while customers whose orders were delivered late gave an average score of only **2.56**.
+
+The median review score was **5** for on-time deliveries and **2** for late deliveries. This indicates a substantial relationship between delivery performance and customer satisfaction.
+
+The difference in review scores was tested using a Wilcoxon rank-sum test.
+
+```{r}
+#| echo: false
+
+wilcox_review_delivery
+```
+
+The test produced a **p-value below 2.2 × 10⁻¹⁶**, providing very strong statistical evidence that review-score distributions differ between on-time and late deliveries.
+
+### Review Scores by Delivery Status
+
+The difference can also be seen visually in the distribution of review scores.
+
+```{r}
+#| echo: false
+#| fig-cap: "Review scores for on-time and late deliveries."
+
+ggplot(
+  first_order_analysis %>%
+    filter(
+      !is.na(review_score),
+      !is.na(delivered_late)
+    ),
+  aes(
+    x = factor(
+      delivered_late,
+      levels = c(0, 1),
+      labels = c("On time", "Late")
+    ),
+    y = review_score
+  )
+) +
+  geom_boxplot() +
+  labs(
+    x = "Delivery status",
+    y = "Review score"
+  ) +
+  theme_minimal()
+```
+
+The distribution shows that late deliveries are associated with substantially lower review scores.
+
+### Delivery Performance and Repeat Purchases
+
+The repeat-purchase rate was also compared between on-time and late deliveries.
+
+```{r}
+#| echo: false
+
+repeat_by_delivery
+```
+
+The repeat-purchase rate was **2.19%** for customers whose first order was delivered on time, compared with **1.55%** for customers whose first order was delivered late.
+
+A chi-squared test was used to evaluate the association between delivery status and repeat purchasing.
+
+```{r}
+#| echo: false
+
+delivery_repeat_test
+```
+
+The test produced a **p-value of 0.0006**, indicating a statistically significant association between delivery status and repeat purchasing.
+
+The difference is relatively small in absolute terms, however. Therefore, delivery performance appears to have a much stronger relationship with customer satisfaction than with repeat purchasing in this dataset.
+
+### Repeat Purchase Rate by Delivery Status
+
+```{r}
+#| echo: false
+#| fig-cap: "Repeat-purchase rate for customers with on-time and late first deliveries."
+
+ggplot(
+  repeat_by_delivery,
+  aes(
+    x = factor(
+      delivered_late,
+      levels = c(0, 1),
+      labels = c("On time", "Late")
+    ),
+    y = repeat_rate
+  )
+) +
+  geom_col() +
+  labs(
+    x = "Delivery status",
+    y = "Repeat purchase rate (%)"
+  ) +
+  theme_minimal()
+```
+
+The figure shows the lower repeat-purchase rate among customers whose first order was delivered late. Although the difference is statistically significant, the effect is considerably smaller than the difference observed in review scores.
+
+### Conclusion
+
+The analysis shows a strong association between delivery performance and customer satisfaction. Late deliveries are associated with substantially lower review scores, with the average score falling from **4.29** for on-time deliveries to **2.56** for late deliveries.
+
+Delivery performance is also statistically associated with repeat purchasing. Customers with on-time first deliveries had a repeat-purchase rate of **2.19%**, compared with **1.55%** among customers whose first delivery was late.
+
+However, the results should be interpreted as **associations rather than causal effects**. Other factors may influence both delivery performance and customer behavior. Nevertheless, the results suggest that reliable delivery is strongly related to customer satisfaction and may also be relevant for customer retention.
